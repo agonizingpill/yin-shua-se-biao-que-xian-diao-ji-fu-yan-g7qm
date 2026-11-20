@@ -27,7 +27,10 @@ class ProofSheet(Base):
     density_y:Mapped[float]=mapped_column(Float)
     density_k:Mapped[float]=mapped_column(Float)
     dot_gain:Mapped[float]=mapped_column(Float)
-    defect:Mapped[str|None]=mapped_column(String(20),nullable=True)
+    # defect 保留为展示用主标签（多缺陷时以“、”连接，无缺陷为合格）
+    defect:Mapped[str|None]=mapped_column(String(40),nullable=True)
+    # 多标签权威结果：如 ["乳化","偏色"]，无缺陷为 []
+    defects:Mapped[list|None]=mapped_column(JSON,nullable=True)
     pass_flag:Mapped[bool]=mapped_column(Boolean,default=False)
     classification_state:Mapped[str]=mapped_column(String(20),default='unmeasured')
     classified_at:Mapped[str|None]=mapped_column(String(40),nullable=True)
@@ -37,12 +40,36 @@ class Adjustment(Base):
     id:Mapped[int]=mapped_column(primary_key=True)
     job_id:Mapped[int]=mapped_column(ForeignKey('print_jobs.id'))
     proof_id:Mapped[int]=mapped_column(ForeignKey('proof_sheets.id'),unique=True)
-    ink_delta:Mapped[float]=mapped_column(Float)
-    water_delta:Mapped[float]=mapped_column(Float)
+    ink_delta:Mapped[float]=mapped_column(Float,default=0)
+    water_delta:Mapped[float]=mapped_column(Float,default=0)
     status:Mapped[str]=mapped_column(String(20),default='issued')
     executed_at:Mapped[str|None]=mapped_column(String(40),nullable=True)
     reproof_id:Mapped[int|None]=mapped_column(ForeignKey('proof_sheets.id'),nullable=True)
     signed_by:Mapped[str|None]=mapped_column(String(100),nullable=True)
+    # 首张判出的缺陷清单快照，逐项处置以此为准
+    defects:Mapped[list]=mapped_column(JSON,default=list)
+    # 已送验但被中途补做处置作废的复验张（迟回合格也另取）
+    invalidated_reproof_ids:Mapped[list]=mapped_column(JSON,default=list)
+class AdjustmentAction(Base):
+    """逐项处置：每个缺陷一行，先逐项登记执行，再收新复验张。"""
+    __tablename__='adjustment_actions'
+    id:Mapped[int]=mapped_column(primary_key=True)
+    adjustment_id:Mapped[int]=mapped_column(ForeignKey('adjustments.id'))
+    defect_type:Mapped[str]=mapped_column(String(20))
+    ink_delta:Mapped[float]=mapped_column(Float,default=0)
+    water_delta:Mapped[float]=mapped_column(Float,default=0)
+    status:Mapped[str]=mapped_column(String(20),default='issued')
+    executed_at:Mapped[str|None]=mapped_column(String(40),nullable=True)
+    executed_by:Mapped[str|None]=mapped_column(String(100),nullable=True)
+class ReproofAttempt(Base):
+    """签印尝试登记：以签印当下已登记（已执行）的处置为准判定复验张是否失效。"""
+    __tablename__='reproof_attempts'
+    id:Mapped[int]=mapped_column(primary_key=True)
+    adjustment_id:Mapped[int]=mapped_column(ForeignKey('adjustments.id'))
+    proof_id:Mapped[int]=mapped_column(ForeignKey('proof_sheets.id'))
+    state:Mapped[str]=mapped_column(String(20),default='attempted')  # attempted / accepted / stale / rejected
+    detail:Mapped[str]=mapped_column(String(300),default='')
+    created_at:Mapped[str]=mapped_column(String(40))
 class ReferenceSheet(Base):
     __tablename__='reference_sheets'
     id:Mapped[int]=mapped_column(primary_key=True)
@@ -52,7 +79,10 @@ class ReferenceSheet(Base):
     density_y:Mapped[float]=mapped_column(Float)
     density_k:Mapped[float]=mapped_column(Float)
     dot_gain:Mapped[float]=mapped_column(Float)
+    # 旧单标签（参考张分别只标记一种缺陷），仅作展示与未知口径证据
     label:Mapped[str]=mapped_column(String(20))
+    # 多标签：单标签参考只含自身类型；“乳化+偏色”参考两类都标
+    defects:Mapped[list]=mapped_column(JSON,default=list)
 class Audit(Base):
     __tablename__='audits'
     id:Mapped[int]=mapped_column(primary_key=True)

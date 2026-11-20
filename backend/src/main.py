@@ -6,10 +6,10 @@ from sqlalchemy.exc import IntegrityError
 from fastapi import FastAPI,Depends,HTTPException
 from fastapi.responses import JSONResponse
 from .db import Base,engine,db_session
-from .models import User,PrintJob,ProofSheet,Adjustment,Audit
+from .models import User,PrintJob,ProofSheet,Adjustment,AdjustmentAction,Audit
 from .auth import current,writers,admin,verify,token
-from .schemas import Login,JobInput,ProofInput,AdjustmentInput,InstructionInput,ReproofInput
-from .services import get,pack,audit,editable_proof,issue,change_instruction,sign,now
+from .schemas import Login,JobInput,ProofInput,AdjustmentInput,InstructionInput,ActionInstructionInput,ActionExecuteInput,ReproofInput
+from .services import get,pack,audit,editable_proof,issue,change_instruction,change_action,execute_action,execute_all,adjustment_view,sign,now
 from .middlewares import RequestTrace,BurstGuard
 from .production_routes import router as production
 from .dispatch_routes import router as dispatches
@@ -66,33 +66,50 @@ def edit_proof(pid:int,p:ProofInput,s=Depends(db_session),u=Depends(writers)):
     x=get(s,ProofSheet,pid);editable_proof(s,x)
     if p.job_id!=x.job_id:raise HTTPException(409,'色标不得转移到其他工单')
     for k,value in p.model_dump().items():setattr(x,k,value)
-    x.defect=None;x.pass_flag=False;x.evidence=None;x.classification_state='unmeasured';x.classified_at=None;audit(s,u,'修订色标 '+x.code);s.commit();return pack(x)
+    x.defect=None;x.defects=None;x.pass_flag=False;x.evidence=None;x.classification_state='unmeasured';x.classified_at=None;audit(s,u,'修订色标 '+x.code);s.commit();return pack(x)
 @app.post('/proofs/{pid}/classify')
 def classify(pid:int,s=Depends(db_session),u=Depends(writers)):
-    x=get(s,ProofSheet,pid);editable_proof(s,x);x.classification_state='classifying';x.defect=None;x.pass_flag=False;x.evidence=None;x.classified_at=None;audit(s,u,'色标判读入队 '+x.code);s.commit()
+    x=get(s,ProofSheet,pid);editable_proof(s,x);x.classification_state='classifying';x.defect=None;x.defects=None;x.pass_flag=False;x.evidence=None;x.classified_at=None;audit(s,u,'色标判读入队 '+x.code);s.commit()
     try:r.rpush('press-classify',pid)
     except Exception:x.classification_state='failed';s.commit();raise HTTPException(503,'判读队列暂不可用，请重试')
     return pack(x)
 @app.get('/adjustments')
-def adjustments(s=Depends(db_session),u=Depends(current)):return [pack(x)for x in s.scalars(select(Adjustment).order_by(Adjustment.id))]
+def adjustments(s=Depends(db_session),u=Depends(current)):return [adjustment_view(s,x)for x in s.scalars(select(Adjustment).order_by(Adjustment.id))]
 @app.post('/adjustments')
 def create_adjustment(p:AdjustmentInput,s=Depends(db_session),u=Depends(writers)):
-    x=issue(s,p.proof_id);audit(s,u,'生成调机指令 色标#'+str(p.proof_id));s.commit();return pack(x)
+    x=issue(s,p.proof_id);audit(s,u,'生成调机指令 色标#'+str(p.proof_id)+' 缺陷'+'、'.join(x.defects));s.commit();return adjustment_view(s,x)
 @app.patch('/adjustments/{aid}')
 def patch_instruction(aid:int,p:InstructionInput,s=Depends(db_session),u=Depends(writers)):
-    x=get(s,Adjustment,aid);change_instruction(s,x,p);audit(s,u,'修订调机指令#'+str(aid));s.commit();return pack(x)
+    x=get(s,Adjustment,aid);change_instruction(s,x,p);audit(s,u,'修订调机指令#'+str(aid));s.commit();return adjustment_view(s,x)
+@app.get('/adjustments/{aid}/actions')
+def list_actions(aid:int,s=Depends(db_session),u=Depends(current)):
+    a=get(s,Adjustment,aid);return [pack(x)for x in s.scalars(select(AdjustmentAction).where(AdjustmentAction.adjustment_id==aid).order_by(AdjustmentAction.id))]
+@app.patch('/adjustments/actions/{action_id}')
+def patch_action(action_id:int,p:ActionInstructionInput,s=Depends(db_session),u=Depends(writers)):
+    act=get(s,AdjustmentAction,action_id);change_action(s,act,p);audit(s,u,f'逐项修订处置#{action_id} {act.defect_type}');s.commit();return pack(act)
+@app.post('/adjustments/actions/{action_id}/execute')
+def do_action(action_id:int,s=Depends(db_session),u=Depends(writers)):
+    act=get(s,AdjustmentAction,action_id);a=execute_action(s,act,u);audit(s,u,f'逐项登记处置执行#{action_id} {act.defect_type}');s.commit();return adjustment_view(s,a)
+@app.post('/adjustments/{aid}/actions/execute')
+def do_actions(aid:int,p:ActionExecuteInput,s=Depends(db_session),u=Depends(writers)):
+    a=get(s,Adjustment,aid)
+    if p.action_ids:
+        for i in p.action_ids:
+            act=get(s,AdjustmentAction,i)
+            if act.adjustment_id!=a.id:raise HTTPException(409,'处置项不属于该调机单')
+            a=execute_action(s,act,u)
+        audit(s,u,f'批量登记处置执行 调机单#{aid} '+','.join(map(str,p.action_ids)))
+    else:
+        a=execute_all(s,a,u);audit(s,u,'登记全部待执行处置 调机单#'+str(aid))
+    s.commit();return adjustment_view(s,a)
 @app.post('/adjustments/{aid}/execute')
 def execute(aid:int,s=Depends(db_session),u=Depends(writers)):
     x=s.query(Adjustment).filter_by(id=aid).with_for_update().one_or_none()
     if not x:raise HTTPException(404,'调机指令不存在')
-    if x.status!='issued':raise HTTPException(409,'仅待执行指令可登记执行')
-    s.query(PrintJob).filter_by(id=x.job_id).with_for_update().one()
-    require_ready(s,x.job_id)
-    from .inspection_service import ready
-    ready(s,x.job_id)
-    x.status='executed';x.executed_at=now();audit(s,u,'登记调机执行#'+str(aid));s.commit();return pack(x)
+    if x.status=='signed':raise HTTPException(409,'已签印调机不能重复执行')
+    x=execute_all(s,x,u);audit(s,u,'登记调机执行#'+str(aid));s.commit();return adjustment_view(s,x)
 @app.post('/adjustments/{aid}/sign')
 def approve(aid:int,p:ReproofInput,s=Depends(db_session),u=Depends(admin)):
-    x=sign(s,aid,p.reproof_id,u);audit(s,u,'主管签印#'+str(aid));s.commit();return pack(x)
+    x=sign(s,aid,p.reproof_id,u);audit(s,u,'主管签印#'+str(aid));s.commit();return adjustment_view(s,x)
 @app.get('/audits')
 def audits(s=Depends(db_session),u=Depends(current)):return [pack(x)for x in s.scalars(select(Audit).order_by(Audit.id.desc()).limit(30))]

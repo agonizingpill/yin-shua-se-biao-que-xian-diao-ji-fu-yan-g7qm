@@ -18,7 +18,14 @@ class ProofInput(BaseModel):
 class AdjustmentInput(BaseModel):
     proof_id:int
 class InstructionInput(BaseModel):
+    # 旧接口保留：整体修订（两个单缺陷指令场景仍可用）
     ink_delta:float=Field(ge=-15,le=15)
     water_delta:float=Field(ge=-15,le=15)
+class ActionInstructionInput(BaseModel):
+    # 逐项修订某一缺陷处置
+    ink_delta:float=Field(ge=-15,le=15)
+    water_delta:float=Field(ge=-15,le=15)
+class ActionExecuteInput(BaseModel):
+    action_ids:list[int]=Field(default_factory=list)
 class ReproofInput(BaseModel):
     reproof_id:int

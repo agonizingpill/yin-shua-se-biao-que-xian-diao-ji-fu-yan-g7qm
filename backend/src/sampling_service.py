@@ -34,7 +34,7 @@ def finish(s,proof):
     item=s.scalar(select(PressSample).where(PressSample.proof_id==proof.id).with_for_update())
     if not item or item.state!='classifying':return
     job=s.scalar(select(PrintJob).where(PrintJob.id==item.job_id).with_for_update())
-    if proof.classification_state=='classified' and proof.pass_flag and proof.defect=='合格':item.state='passed';return
+    if proof.classification_state=='classified' and proof.pass_flag:item.state='passed';return
     item.state='held';job.status='hold'
     hold=PressHold(job_id=job.id,sample_id=item.id,reason='量产抽检 '+proof.code+' / '+(proof.defect or '判读失败'),created_at=now(),reproof_ids=[]);s.add(hold)
 
@@ -55,6 +55,6 @@ def close(s,key,p,u):
     require_ready(s,job.id)
     if not hold.reproof_id:raise HTTPException(409,'须登记停机后的新色标复验')
     proof=get(s,ProofSheet,hold.reproof_id)
-    if proof.job_id!=job.id or proof.classification_state!='classified' or not proof.pass_flag or proof.defect!='合格' or not proof.classified_at or proof.classified_at<hold.created_at:raise HTTPException(409,'停机后新色标未判为合格，不能复机')
+    if proof.job_id!=job.id or proof.classification_state!='classified' or not proof.pass_flag or not proof.classified_at or proof.classified_at<hold.created_at:raise HTTPException(409,'停机后新色标未判为合格，不能复机')
     hold.state='closed';hold.resolution=p.resolution;hold.closed_by=u.email;hold.closed_at=now();job.status='production'
     audit(s,u,f'主管复机 停机单{key} 依据{p.resolution}');s.commit();return hold

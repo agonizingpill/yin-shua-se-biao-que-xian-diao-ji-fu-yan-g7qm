@@ -7,9 +7,9 @@
 ## 多模块流程
 
 - PrintJob开机单：编号、印件、纸张、目标密度、setup/adjusting/production/hold状态；已有判读/调机后规格冻结。
-- ProofSheet色标：四色密度、网点扩大率、工单外键、真实缺陷/概率/分类证据。未关联色标可校正并清除旧判读，已作为调机首张或签印复验张则冻结。
-- 缺陷判读：Python worker以StandardScaler+RBF SVM区分合格/乳化/偏色，当前送测样不进入参考训练。页面显示概率和30张留出混淆矩阵。
-- Adjustment调机与复验：乳化默认供水−8%、偏色默认供墨−6%；待执行可在规则范围内修订，执行后指令冻结。主管签印要求已执行、不同于首张的同工单合格复验，且复验判读晚于执行。成功同时闭合Adjustment、关联reproof_id、PrintJob进入production。
+- ProofSheet色标：四色密度、网点扩大率、工单外键、多标签缺陷defects（如["乳化","偏色"]，无缺陷为[]）、展示标签defect、真实概率/分类证据。未关联色标可校正并清除旧判读，已作为调机首张或签印复验张则冻结。
+- 缺陷判读：Python worker对乳化、偏色各训练一个StandardScaler+RBF SVM二分类器，一张色标可同时判出两类缺陷；当前送测样不进入参考训练。页面显示逐缺陷概率、0.9置信门槛和按整张分层的留出混淆矩阵。旧单标签参考漏标的另一类按“未知”处理，既不当负例也不参与该类评估。
+- Adjustment调机与复验：每个判出缺陷生成一行AdjustmentAction逐项处置（乳化默认供水−8%、偏色默认供墨−6%），待执行可在规则内修订、逐项或批量登记执行；全部执行后调机单才进入executed。主管签印要求全部处置已执行、不同于首张的同工单合格复验，且复验判读晚于最后一次处置执行。中途补做处置会使已送验张失效（迟回合格也须另取），ReproofAttempt保留每次签印尝试；成功同时闭合Adjustment、关联reproof_id、PrintJob进入production。
 
 ## 快速启动
 
@@ -34,16 +34,28 @@ JWT8小时；密码PBKDF2-SHA256盐化；本地演示部署前修改JWT_SECRET�
 
 1. 08:30 打开PJ-26091画册封套，157g哑粉纸、目标密度1.40。
 2. 09:00 核对PS-FIRST：C1.02/M1.04/Y1.00/K1.05，网点扩大28%。
-3. 09:30 后台读取首张，SVM判为乳化，生成减供水8%的调机单。
-4. 10:00 机长可在待执行时修成减供水7%，乳化指令不能改成增水。
-5. 10:30 先登记印版、测量套准并主管认可就绪，再登记调机执行，首张与执行指令冻结；此时不能用执行前的旧合格判读签印。
-6. 11:00 不合格PS-FAIL与跨工单PS-OTHER作为异常分支均被拒绝。
-7. 14:00 重新读取同工单PS-RECHECK（约1.40四色密度，扩大14%）为合格，主管签印。
+3. 09:30 后台读取首张，多标签判读同时给出乳化/偏色两个二分类结果，按判出缺陷逐项生成减供水8%、减供墨6%等处置。
+4. 10:00 机长可在待执行时把某项减供水修成7%，乳化指令不能改成增水；逐项登记执行，全部执行后调机单才闭合执行环节。
+5. 10:30 先登记印版、测量套准并主管认可就绪，再逐项登记调机执行，首张与已执行指令冻结；此时不能用执行前的旧合格判读签印。
+6. 11:00 不合格PS-FAIL与跨工单PS-OTHER作为异常分支均被拒绝；执行后又补做处置的，已送验张即使迟回合格也标记失效、须另取。
+7. 14:00 重新读取同工单PS-RECHECK（约1.40四色密度，扩大14%）为合格，判读晚于最后处置执行，主管签印。
 8. 16:00 工单production、Adjustment signed、reproof_id关联一致，观察员查询闭合依据。第二工单PJ-26092演练偏色供墨调整。
+
+## 多标签判读、逐项处置与复验失效（V4）
+
+**双缺陷同判**：一张色标可能既偏色又乳化，旧单标签判读只报一种、调机漏项。参考色标分别标记缺陷：旧150张每张只标一类（合格/乳化/偏色各50），新增40张“乳化+偏色”双标签张。`ReferenceSheet.defects`保存多标签，旧标签保留在`label`列作为证据。判读时对乳化、偏色各开一个二分类SVM：旧单标签参考漏标的另一类按**未知**处理（目标值−1），既不当负例训练，也不参与该类留出准确率，仅统计其被误报为正例的次数。
+
+**按整张分开训练和留出**：以四类多标签组合（合格/仅乳化/仅偏色/乳化+偏色）为分层依据，固定seed42将190张按整张拆为训练/留出，同一张不会同时出现在两侧。概率门槛0.9：留出验证中真实正例概率≥0.979，而漏标未知行最高仅0.839，门槛下未知误报为0且留出准确率不降；低于门槛的正例倾向不强行断言，页面标注“未知区”。
+
+**逐项处置与复验失效**：调机单按判出缺陷生成多行`AdjustmentAction`，机长先逐项（或一次全部）登记处置执行，全部执行后调机单才进入executed；之后才能收新复验张。复验张须同工单、不同于首张、判为合格且判读晚于**最后一次**处置执行。中途补做处置后，已送验张进入`Adjustment.invalidated_reproof_ids`，即使迟回合格也必须另取新张；每次签印尝试写入`ReproofAttempt`（accepted/stale/rejected及原因）。补做执行与主管签印并发时，签印事务先锁调机单，以签印当下已提交登记的处置为准，未全部执行即拒绝签印。
+
+新增接口：`GET /adjustments/{aid}/actions`、`PATCH /adjustments/actions/{id}`、`POST /adjustments/actions/{id}/execute`、`POST /adjustments/{aid}/actions/execute`；`GET /adjustments`返回视图含actions、reproof_attempts、invalidated_reproofs。旧`PATCH/POST /adjustments/{aid}`与`/execute`保留（多缺陷调机单的整体修订会提示改用逐项接口）。前端缺陷判读页显示逐缺陷概率/门槛/逐类混淆矩阵/未知行统计，调机页改为逐项处置卡片与复验尝试留痕表。
+
+验证：`backend/tests/test_flow.py`（SQLite端到端29项断言，含多标签判读、逐项执行、补做失效、并发签印）与`test_api.py`（TestClient HTTP规则20项）。本地无MySQL/Redis时可用`PYTHONPATH`指向独立依赖目录、SQLite与假Redis运行，测试不依赖Docker。
 
 ## 真算与验证口径
 
-独立ReferenceSheet150张模拟标签色标，每类50张；送测ProofSheet从不插入参考。按标签分层固定seed42拆为120训练/30留出，StandardScaler仅训练fit，SVC(kernel=rbf,C=2,probability=True,random_state=42)只训练拟合，输出当前样张predict/proba及留出accuracy、固定类别顺序混淆矩阵。密度除以本工单target_density，网点扩大除100；参考密度按1.4标准归一化。概率仅为模型倾向，不替代执行后的现场复验。参考数据固定seed生成，可复现但不代表真实生产准确率。
+独立ReferenceSheet模拟标签色标（旧150张单标签+40张双缺陷标签）；送测ProofSheet从不插入参考。按四类多标签组合分层、固定seed42将参考按整张拆为训练/留出（约8:2），StandardScaler仅训练fit，每个缺陷类型一个SVC(kernel=rbf,C=2,probability=True,random_state=42)只在明确0/1标签的训练整张贴上拟合，输出当前样张逐缺陷predict/proba（0.9置信门槛）及逐类留出accuracy、固定[0,1]顺序混淆矩阵、漏标未知行误报统计。密度除以本工单target_density，网点扩大除100；参考密度按1.4标准归一化。概率仅为模型倾向，不替代执行后的现场复验。参考数据固定seed生成，可复现但不代表真实生产准确率。
 
 worker通过Redis取proof_id，结果持久化ProofSheet，另写backend/worker共享卷`/artifacts/proof-<id>.json`。证据包含参考/留出编号，能证明训练与验证互斥以及当前色标不入训练。参考少于60张判读失败。
 
@@ -58,13 +70,13 @@ worker通过Redis取proof_id，结果持久化ProofSheet，另写backend/worker�
 
 五服务frontend/backend/worker/db/redis健康检查齐全。MySQL用TCP业务账号SELECT1，worker心跳，frontend依赖backend健康。Nginx/api去掉前缀代理。环境变量与端口在.env.example，专用子网10.221.30.0/24可改为本机空闲子网，SEED_DEMO启动自动补演示数据。seed自然键仅增缺失，保留用户修改。
 
-backend/src/models.py三个实体+参考/User/Audit；schemas.py输入；services.py冻结/调机/签印规则；classifier.py训练与验证；worker.py真实计算；main.py权限路由；auth.py认证；middlewares.py请求ID/限流。frontend/src/pages/jobs/proofs/diagnosis/adjustments.js及plates/samples.js对应六页；api.js客户端、store.js状态、components/press.js色标条/状态/选择器跨页共用、utils/format.js数字/转义/表单工具。
+backend/src/models.py开机单/色标/调机单/逐项处置AdjustmentAction/签印尝试ReproofAttempt/参考/User/Audit；schemas.py输入；services.py冻结/逐项处置/复验失效/签印规则；classifier.py两个二分类器训练、整张留出与未知口径；worker.py真实计算；main.py权限路由；auth.py认证；middlewares.py请求ID/限流。frontend/src/pages/jobs/proofs/diagnosis/adjustments.js及plates/samples.js等九页；api.js客户端、store.js状态、components/press.js色标条/状态/选择器跨页共用、utils/format.js数字/转义/表单工具。
 
 角色、缺陷、工单和指令状态在backend/src/constants.py与frontend/src/constants.js；后端执行所有权限与状态约束，页面按钮禁用作提示；完整性异常返回可恢复409。
 
 本地设置DATABASE_URL/REDIS_URL，安装backend/requirements.txt，在backend目录运行`uvicorn src.main:app --reload`与`python -m src.worker`，前端建议使用Compose代理。停止保留数据`docker compose down`，验收清理`down -v --remove-orphans`。测试/截图/日志在`../../test-artifacts/gb-1030/`。
 
-已知范围：模拟色标可分性较强，留出高准确率不代表真实印刷；单机工单流程，已扩展量产抽检及停复机；未实现撤销历史签印或多轮缺陷合并。执行后的判读时间用于复验时序，没有接入硬件取样防伪。worker故障无可靠作业重投。Google字体离线回退。License MIT。
+已知范围：模拟色标可分性较强，留出高准确率不代表真实印刷；0.9置信门槛由当前模拟留出确定，真实数据需重新标定；单机工单流程，已扩展量产抽检及停复机；未实现撤销历史签印。执行后的判读时间用于复验时序，没有接入硬件取样防伪。worker故障无可靠作业重投。Google字体离线回退。License MIT。
 
 
 ## 印版版本与量产停复机扩展

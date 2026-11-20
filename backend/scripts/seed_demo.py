@@ -6,6 +6,10 @@ from src.auth import hash_password
 from src.production_models import PlateSet,PressSample,PressHold
 from src.dispatch_models import PaperLot,PressMachine
 
+# 四类多标签组合的模拟分布：合格 / 仅乳化 / 仅偏色 / 乳化+偏色
+MEANS={'合格':[1.4,1.4,1.4,1.4,14],'乳化':[1.02,1.04,1.0,1.05,28],
+       '偏色':[1.7,1.1,1.55,1.4,15],'乳化+偏色':[1.24,1.06,1.46,1.27,23]}
+
 def seed():
     Base.metadata.create_all(engine)
     with Session()as s:
@@ -15,15 +19,28 @@ def seed():
         for code,title,paper in [('PJ-26091','画册封套','157g 哑粉'),('PJ-26092','展览折页','128g 铜版')]:
             if not s.scalar(select(PrintJob).where(PrintJob.code==code)):s.add(PrintJob(code=code,title=title,paper=paper,target_density=1.4,status='setup'))
         s.flush();jobs=s.scalars(select(PrintJob).order_by(PrintJob.id)).all()
-        for code,j,vals in [('PS-FIRST',0,[1.02,1.04,1.0,1.05,28]),('PS-RECHECK',0,[1.4,1.39,1.41,1.4,14]),('PS-FAIL',0,[1.01,1.0,1.03,1.05,29]),('PS-OTHER',1,[1.4,1.4,1.4,1.4,14]),('PS-OTHER-BAD',1,[1.7,1.1,1.55,1.4,15])]:
+        # 双缺陷首张：既偏色又乳化，旧单标签判读只会报其中一种
+        for code,j,vals in [('PS-FIRST',0,[1.02,1.04,1.0,1.05,28]),('PS-RECHECK',0,[1.4,1.39,1.41,1.4,14]),
+                            ('PS-FAIL',0,[1.01,1.0,1.03,1.05,29]),('PS-OTHER',1,[1.4,1.4,1.4,1.4,14]),
+                            ('PS-OTHER-BAD',1,[1.7,1.1,1.55,1.4,15]),('PS-BOTH',0,[1.24,1.06,1.46,1.27,23])]:
             if not s.scalar(select(ProofSheet).where(ProofSheet.code==code)):s.add(ProofSheet(code=code,job_id=jobs[j].id,density_c=vals[0],density_m=vals[1],density_y=vals[2],density_k=vals[3],dot_gain=vals[4]))
         for job in jobs:
             if not s.scalar(select(PlateSet).where(PlateSet.job_id==job.id,PlateSet.version=='V1')):s.add(PlateSet(job_id=job.id,version='V1',source_note='客户定稿PDF转四色印版，首版待上机测量'))
         rng=random.Random(42)
+        # 旧150张：每张只标一种缺陷，漏标的另一类在判读时按未知处理
         for i in range(150):
-            label=['合格','乳化','偏色'][i//50];means={'合格':[1.4,1.4,1.4,1.4,14],'乳化':[1.02,1.04,1.0,1.05,28],'偏色':[1.7,1.1,1.55,1.4,15]}[label]
+            label=['合格','乳化','偏色'][i//50];means=MEANS[label]
             vals=[round(rng.gauss(mean,.028 if j<4 else 1),4)for j,mean in enumerate(means)];code=f'REF-{i+1:03}'
-            if not s.scalar(select(ReferenceSheet).where(ReferenceSheet.code==code)):s.add(ReferenceSheet(code=code,density_c=vals[0],density_m=vals[1],density_y=vals[2],density_k=vals[3],dot_gain=vals[4],label=label))
+            ref=s.scalar(select(ReferenceSheet).where(ReferenceSheet.code==code))
+            if not ref:s.add(ReferenceSheet(code=code,density_c=vals[0],density_m=vals[1],density_y=vals[2],density_k=vals[3],dot_gain=vals[4],label=label,defects=[]if label=='合格'else[label]))
+        # 新增40张双缺陷参考：两类缺陷都标记，与旧单标签参考按整张分开训练/留出
+        for i in range(40):
+            code=f'REF-BOTH-{i+1:02}';means=MEANS['乳化+偏色']
+            vals=[round(rng.gauss(mean,.028 if j<4 else 1),4)for j,mean in enumerate(means)]
+            if not s.scalar(select(ReferenceSheet).where(ReferenceSheet.code==code)):s.add(ReferenceSheet(code=code,density_c=vals[0],density_m=vals[1],density_y=vals[2],density_k=vals[3],dot_gain=vals[4],label='乳化+偏色',defects=['乳化','偏色']))
+        # 旧库回填多标签字段，保持旧单标签证据不丢失
+        for ref in s.scalars(select(ReferenceSheet)).all():
+            if not ref.defects:ref.defects=[]if ref.label=='合格'else [ref.label]
         for code,gsm,qty in [('PAPER-157-A',157,20000),('PAPER-128-A',128,8000)]:
             if not s.scalar(select(PaperLot).where(PaperLot.code==code)):s.add(PaperLot(code=code,gsm=gsm,available_sheets=qty))
         if not s.scalar(select(PressMachine).where(PressMachine.code=='PRESS-04')):s.add(PressMachine(code='PRESS-04'))
